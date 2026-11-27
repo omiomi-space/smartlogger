@@ -37,7 +37,16 @@ pip install -r pc_viewer/requirements.txt
 python pc_viewer/viewer.py
 ```
 
-初回起動時に Windows ファイアウォールの許可ダイアログが出たら「プライベートネットワーク」を許可してください。
+起動時に Windows ファイアウォールの受信許可ルール（`SmartLogger-UDP-<ポート>`）があるか確認し、無ければ
+「UDP ポート 5005 の受信を許可しますか？」というダイアログを表示します。「はい」→ 管理者権限の確認 (UAC) を許可すると、
+全ネットワークプロファイル（プライベート/パブリック/ドメイン）でそのポートの UDP 受信を許可するルールを追加します。
+2 回目以降はルールがあるので表示されません。確認を出したくない場合は `--no-firewall` を付けて起動してください。
+
+ルールを削除する場合（管理者 PowerShell）:
+
+```powershell
+netsh advfirewall firewall delete rule name=SmartLogger-UDP-5005
+```
 
 オプション:
 
@@ -48,6 +57,7 @@ python pc_viewer/viewer.py
 | `--alt` | baro | 高さのソース（`baro` 気圧 / `gps`） |
 | `--smooth` | 4 | 位置の平滑化レート [1/s] |
 | `--accel-scale` | 0.3 | 加速度矢印の長さ [m per m/s²] |
+| `--no-firewall` | - | 起動時のファイアウォール確認をしない |
 
 操作: 左ドラッグ = 視点回転 / ホイール = ズーム / `F` = 追従 ON/OFF / `R` = 原点リセット / `T` = 軌跡表示 / `A` = 加速度矢印 / `Esc` = 終了
 

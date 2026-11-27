@@ -18,6 +18,8 @@ import argparse
 import json
 import math
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -443,6 +445,56 @@ class Viewer(ShowBase):
         return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- Windows firewall
+
+def _fw_rule_name(port):
+    return f"SmartLogger-UDP-{port}"
+
+
+def firewall_rule_exists(port):
+    r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", f"name={_fw_rule_name(port)}"],
+                       capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.returncode == 0
+
+
+def ensure_firewall(port):
+    """On Windows, offer to add an inbound allow rule for the UDP port (asks via dialog + UAC)."""
+    if sys.platform != "win32":
+        return
+    try:
+        if firewall_rule_exists(port):
+            print(f"[firewall] rule '{_fw_rule_name(port)}' already exists")
+            return
+    except OSError as e:
+        print(f"[firewall] cannot query rules: {e}")
+        return
+    import ctypes
+    MB_YESNO, MB_ICONQUESTION, MB_ICONINFO, MB_ICONWARN, MB_TOPMOST, IDYES = 0x4, 0x20, 0x40, 0x30, 0x40000, 6
+    box = ctypes.windll.user32.MessageBoxW
+    msg = (f"スマホからのデータを受信するため、Windows ファイアウォールで\n"
+           f"UDP ポート {port} の受信を許可しますか？\n\n"
+           f"「はい」を押すと管理者権限の確認 (UAC) が表示されます。\n"
+           f"（ルール名: {_fw_rule_name(port)}、全ネットワークプロファイル）")
+    if box(None, msg, "SmartLogger - ファイアウォール", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) != IDYES:
+        print("[firewall] skipped by user")
+        return
+    netsh_args = (f'advfirewall firewall add rule name={_fw_rule_name(port)} dir=in action=allow '
+                  f'protocol=UDP localport={port} profile=any')
+    ps = (f"Start-Process -FilePath netsh -ArgumentList '{netsh_args}' "
+          f"-Verb RunAs -Wait -WindowStyle Hidden")
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if firewall_rule_exists(port):
+        print(f"[firewall] added rule '{_fw_rule_name(port)}'")
+        box(None, f"UDP ポート {port} の受信を許可しました。", "SmartLogger - ファイアウォール",
+            MB_ICONINFO | MB_TOPMOST)
+    else:
+        print("[firewall] rule was not added (UAC cancelled?)")
+        box(None, "ファイアウォールのルールを追加できませんでした。\n"
+                  "（UAC がキャンセルされた可能性があります）", "SmartLogger - ファイアウォール",
+            MB_ICONWARN | MB_TOPMOST)
+
+
 def main():
     ap = argparse.ArgumentParser(description="SmartLogger real-time 3D viewer")
     ap.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default 5005)")
@@ -451,7 +503,11 @@ def main():
     ap.add_argument("--smooth", type=float, default=4.0, help="position smoothing rate 1/s (default 4)")
     ap.add_argument("--accel-scale", type=float, default=0.3, help="metres per m/s2 for accel arrow")
     ap.add_argument("--grid", type=float, default=100, help="half size of ground grid in metres")
-    Viewer(ap.parse_args()).run()
+    ap.add_argument("--no-firewall", action="store_true", help="skip the Windows firewall check")
+    args = ap.parse_args()
+    if not args.no_firewall:
+        ensure_firewall(args.port)
+    Viewer(args).run()
 
 
 if __name__ == "__main__":
