@@ -17,7 +17,13 @@ Updates:
   GPS velocity (E, N)      from speed + bearing
   barometric height (U)    relative to the first pressure sample
   ZUPT (v = 0)             when the phone is detected to be still (gyro + accel quiet)
-  weak velocity damping    when GPS is stale, so pure dead reckoning cannot run away
+  PDR step velocity        on every detected step: step length / step period along the
+                           direction the phone is pointing (pedestrian dead reckoning)
+  standing (v_EN = 0)      no step for a while (hand-held phone is never perfectly still)
+  weak velocity damping    when GPS is stale and PDR is off, so integration cannot run away
+
+Double-integrating a hand-held phone's acceleration alone drifts within seconds, so for
+walking the step-based PDR velocity is what carries the position between GPS fixes.
 
 Only numpy is needed; this module is independent of the 3D viewer so it can be tested offline.
 """
@@ -56,6 +62,18 @@ class FusionParams:
     stale_gps = 3.0            # min. seconds without GPS before damping velocity (x2.5 GPS interval)
     damping_sigma = 1.5        # pseudo-measurement v=0 sigma while GPS is stale [m/s]
     gate_chi2 = 13.8           # 99.9% for 2 dof; larger innovations get their R inflated
+    gps_vel_max_acc = 10.0     # ignore GPS speed when the fix is worse than this [m] (indoors)
+    # pedestrian dead reckoning
+    pdr = True
+    step_lp_hz = 4.0           # low-pass of vertical world accel for step detection
+    step_thresh = 0.8          # min. peak of vertical accel for a step [m/s^2]
+    step_min_interval = 0.33   # s
+    step_k = 0.45              # Weinberg step length: K * (amax - amin)^(1/4)
+    step_len_min = 0.3
+    step_len_max = 1.1
+    pdr_vel_sigma = 0.25       # m/s
+    step_timeout = 1.2         # s without a step -> standing
+    standing_sigma = 0.15      # m/s
 
 
 class Fusion:
@@ -82,6 +100,18 @@ class Fusion:
         self.gps_interval = 1.0     # running estimate of the GPS fix interval [s]
         self.jump = np.zeros(3)     # position correction applied by GPS updates (for smooth display)
         self.a_world = np.zeros(3)
+        # PDR
+        self._lp = 0.0
+        self._lp1 = 0.0
+        self._lp2 = 0.0
+        self._amax = -1e9
+        self._amin = 1e9
+        self._fwd = np.zeros(2)
+        self.last_step_t = None
+        self.steps = 0
+        self.step_len = 0.0
+        self.heading = None          # deg, 0 = North, 90 = East
+        self._gps_moving_until = -1.0
 
     # ------------------------------------------------------------------ helpers
     def enu(self, lat, lon):
@@ -130,6 +160,40 @@ class Fusion:
             self._quiet.popleft()
         self.still = (t - self._quiet[0]) >= self.prm.still_window
 
+    def _pdr(self, t, dt, q, a):
+        """Step detection on vertical world accel; returns True if a step was detected."""
+        alpha = 1.0 - math.exp(-2 * math.pi * self.prm.step_lp_hz * dt) if dt > 0 else 0.0
+        self._lp2, self._lp1 = self._lp1, self._lp
+        self._lp += alpha * (a[2] - self._lp)
+        self._amax = max(self._amax, self._lp)
+        self._amin = min(self._amin, self._lp)
+        # forward direction: horizontal part of (device +Y) + (device -Z); works flat or upright
+        y = quat_rotate(q, (0.0, 1.0, 0.0))
+        z = quat_rotate(q, (0.0, 0.0, -1.0))
+        self._fwd += np.array([y[0] + z[0], y[1] + z[1]])
+        peak = self._lp1 > self._lp2 and self._lp1 >= self._lp and self._lp1 > self.prm.step_thresh
+        if not peak or (self.last_step_t is not None and t - self.last_step_t < self.prm.step_min_interval):
+            return False
+        period = 0.6 if self.last_step_t is None else min(max(t - self.last_step_t, 0.35), 1.0)
+        rng = max(self._amax - self._amin, 0.0)
+        L = min(max(self.prm.step_k * rng ** 0.25, self.prm.step_len_min), self.prm.step_len_max)
+        n = np.linalg.norm(self._fwd)
+        if n > 1e-6:
+            d = self._fwd / n
+            self.heading = math.degrees(math.atan2(d[0], d[1])) % 360
+            H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
+            self._update(H, d * (L / period), np.eye(2) * self.prm.pdr_vel_sigma ** 2)
+        self.steps += 1
+        self.step_len = L
+        self.last_step_t = t
+        self._amax, self._amin = -1e9, 1e9
+        self._fwd[:] = 0
+        return True
+
+    @property
+    def walking(self):
+        return self.last_step_t is not None and self.last_t is not None and             self.last_t - self.last_step_t < self.prm.step_timeout
+
     # ------------------------------------------------------------------ main entry
     def process(self, pkt):
         """Feed one decoded packet. Returns True if the state changed."""
@@ -150,7 +214,8 @@ class Fusion:
         lin_norm = 0.0
         if q is not None and lin is not None:
             n = math.sqrt(sum(c * c for c in q)) or 1.0
-            a = quat_rotate([c / n for c in q], lin)
+            q = [c / n for c in q]
+            a = quat_rotate(q, lin)
             lin_norm = float(np.linalg.norm(lin))
         self.a_world = a
         if dt > 0:
@@ -161,6 +226,13 @@ class Fusion:
         if self.still:
             H = np.zeros((3, 9)); H[:, 3:6] = np.eye(3)
             self._update(H, np.zeros(3), np.eye(3) * self.prm.zupt_sigma ** 2, gate=False)
+
+        # pedestrian dead reckoning
+        if self.prm.pdr and q is not None and lin is not None:
+            self._pdr(t, dt, q, a)
+            if not self.walking and not self.still and t > self._gps_moving_until:
+                H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
+                self._update(H, np.zeros(2), np.eye(2) * self.prm.standing_sigma ** 2, gate=False)
 
         # barometric height
         p = pkt.get("p")
@@ -187,7 +259,7 @@ class Fusion:
         # GPS stale -> softly pull velocity to zero so dead reckoning stays bounded
         stale = max(self.prm.stale_gps, 2.5 * self.gps_interval)
         if self.last_gps_wall is None or t - self.last_gps_wall > stale:
-            if not self.still:
+            if not self.still and not self.prm.pdr:
                 H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
                 self._update(H, np.zeros(2), np.eye(2) * self.prm.damping_sigma ** 2, gate=False)
         return True
@@ -205,7 +277,9 @@ class Fusion:
         H = np.zeros((2, 9)); H[0, 0] = 1; H[1, 1] = 1
         self._update(H, z, np.eye(2) * sig * sig, gate=self.n_gps > 0)
         spd, brg = gps.get("spd"), gps.get("brg")
-        if spd is not None:
+        if spd is not None and (gps.get("acc") or 99.0) <= self.prm.gps_vel_max_acc:
+            if spd > 1.0:
+                self._gps_moving_until = t + 3.0   # e.g. in a vehicle: don't force "standing"
             if brg is not None and spd > 0.3:
                 b = math.radians(brg)
                 zv = np.array([spd * math.sin(b), spd * math.cos(b)])

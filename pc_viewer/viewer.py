@@ -137,6 +137,7 @@ class Receiver(threading.Thread):
             st = {"pos": f.pos.copy(), "vel": f.vel.copy(), "bias": f.bias.copy(), "jump": f.jump.copy(),
                   "still": f.still, "gps_age": f.gps_age(), "gps_interval": f.gps_interval,
                   "new_fixes": list(self._new_fix_points),
+                  "steps": f.steps, "step_len": f.step_len, "walking": f.walking, "heading": f.heading,
                   "pos_sigma": float(np.sqrt(max(f.P[0, 0], f.P[1, 1])))}
             f.jump[:] = 0
             self._new_fix_points.clear()
@@ -525,7 +526,8 @@ class Viewer(ShowBase):
             age = fs["gps_age"]
             age_txt = "no fix" if age is None else f"{age:4.1f}s ago (every {fs['gps_interval']:.1f}s)"
             lines.append(f"vel  E{v[0]:+6.2f} N{v[1]:+6.2f} U{v[2]:+6.2f} m/s  |{math.hypot(v[0], v[1]) * 3.6:5.1f} km/h|"
-                         f"  {'STILL' if fs['still'] else 'moving'}")
+                         f"  {'STILL' if fs['still'] else ('WALKING' if fs['walking'] else 'standing')}")
+            lines.append(f"steps {fs['steps']}  step {fs['step_len']:.2f} m")
             lines.append(f"mode {self.mode.upper()}  GPS {age_txt}  pos sigma {fs['pos_sigma']:.1f} m"
                          f"  bias {fs['bias'][0]:+.2f} {fs['bias'][1]:+.2f} {fs['bias'][2]:+.2f}")
         lines.append(f"follow {'on' if self.follow else 'off'}")
