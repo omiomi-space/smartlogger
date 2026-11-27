@@ -77,7 +77,8 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
     private final float[] mag = new float[3];
     private final float[] lin = new float[3];
     private float pressure = Float.NaN;
-    private boolean hasQuat, hasAcc, hasGyr, hasMag, hasLin;
+    private final float[] qgame = {1, 0, 0, 0};
+    private boolean hasQuat, hasQgame, hasAcc, hasGyr, hasMag, hasLin;
     private String quatSource = "none";
     private volatile Location lastLocation;
 
@@ -309,6 +310,9 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         }
         if (rv == null) quatSource = "none";
         else sensorManager.registerListener(this, rv, periodUs);
+        // magnetometer-free orientation as well ("qg"): stable indoors, used to align camera tracking
+        Sensor game = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+        if (game != null && rv != game) sensorManager.registerListener(this, game, periodUs);
         int[] types = {Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_GYROSCOPE,
                 Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_LINEAR_ACCELERATION, Sensor.TYPE_PRESSURE};
         for (int t : types) {
@@ -365,6 +369,7 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         b.append("{\"v\":1,\"seq\":").append(seq++)
                 .append(",\"t\":").append(System.currentTimeMillis());
         if (hasQuat) b.append(",\"q\":").append(arr(quat));
+        if (hasQgame) b.append(",\"qg\":").append(arr(qgame));
         if (hasAcc) b.append(",\"acc\":").append(arr(acc));
         if (hasGyr) b.append(",\"gyr\":").append(arr(gyr));
         if (hasMag) b.append(",\"mag\":").append(arr(mag));
@@ -405,10 +410,18 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
     public synchronized void onSensorChanged(SensorEvent e) {
         switch (e.sensor.getType()) {
             case Sensor.TYPE_ROTATION_VECTOR:
-            case Sensor.TYPE_GAME_ROTATION_VECTOR:
                 // [w, x, y, z]: rotates device frame into world frame (X=East, Y=North, Z=Up)
                 SensorManager.getQuaternionFromVector(quat, e.values);
                 hasQuat = true;
+                break;
+            case Sensor.TYPE_GAME_ROTATION_VECTOR:
+                if ("game_rotation_vector".equals(quatSource)) {   // no magnetometer fusion available
+                    SensorManager.getQuaternionFromVector(quat, e.values);
+                    hasQuat = true;
+                } else {
+                    SensorManager.getQuaternionFromVector(qgame, e.values);
+                    hasQgame = true;
+                }
                 break;
             case Sensor.TYPE_ACCELEROMETER:
                 System.arraycopy(e.values, 0, acc, 0, 3); hasAcc = true; break;

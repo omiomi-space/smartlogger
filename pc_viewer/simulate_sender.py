@@ -113,6 +113,7 @@ def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None, ar=False):
     Cinv = [C[0], -C[1], -C[2], -C[3]]
     ar_drift = [0.0, 0.0, 0.0]
     ar_n = 0
+    game_off = qaxis(0, 0, 1, math.radians(rnd.uniform(0, 360)))   # game rotation vector: arbitrary heading
     for k in range(n):
         t = k / rate
         p, walking = traj.pos(t)
@@ -145,7 +146,7 @@ def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None, ar=False):
                 "brg": (math.degrees(math.atan2(v[0], v[1])) % 360) if spd > 0.5 else None,
                 "prov": "sim", "t": t_ms,
             }
-        pkt = {"v": 1, "seq": k, "t": t_ms, "q": q, "acc": acc_dev, "gyr": gyr,
+        pkt = {"v": 1, "seq": k, "t": t_ms, "q": q, "qg": qmul(game_off, q), "acc": acc_dev, "gyr": gyr,
                "mag": [12.0, 25.0, -40.0], "lin": lin_dev, "p": pressure}
         if gps:
             pkt["gps"] = gps

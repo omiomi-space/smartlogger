@@ -21,8 +21,14 @@ Updates:
                            direction the phone is pointing (pedestrian dead reckoning)
   standing (v_EN = 0)      no step for a while (hand-held phone is never perfectly still)
   weak velocity damping    when GPS is stale and PDR is off, so integration cannot run away
-  camera VIO velocity      ARCore pose (if the app sends "ar"): velocity over ~0.25 s windows,
-                           rotated from ARCore's world frame into ENU; replaces PDR while tracking
+  camera VIO position      ARCore pose (if the app sends "ar"): displacement since an anchor
+                           (re-anchored every 2 s, on tracking jumps and tracking loss), rotated
+                           from ARCore's world frame into ENU; replaces PDR while tracking.
+                           Being anchored, it keeps the full displacement across Wi-Fi gaps.
+
+ARCore world -> ENU yaw: from the app's magnetometer-free game rotation vector ("qg", stable
+indoors, follows ARCore re-localisation jumps quickly) plus a very slow magnetometer term for
+North; without "qg" the magnetometer-based estimate is smoothed heavily instead.
 
 Double-integrating a hand-held phone's acceleration alone drifts within seconds, so for
 walking the step-based PDR velocity is what carries the position between GPS fixes.
@@ -78,11 +84,15 @@ class FusionParams:
     standing_sigma = 0.15      # m/s
     # camera visual-inertial odometry (ARCore)
     ar = True
-    ar_window = 0.25           # s, velocity is computed over this window of AR poses
-    ar_vel_sigma = 0.08        # m/s
-    ar_yaw_alpha = 0.02        # EMA weight per AR frame for the ARCore->ENU yaw
-    ar_max_speed = 6.0         # m/s; faster = relocalisation jump, ignored
-    ar_timeout = 0.5           # s without a tracking AR pose -> fall back to PDR
+    ar_anchor_period = 2.0     # s between re-anchoring
+    ar_pos_sigma = 0.03        # m, + ar_pos_sigma_rel * displacement since the anchor
+    ar_pos_sigma_rel = 0.02
+    ar_max_speed = 4.0         # m/s between two camera frames; faster = re-localisation jump
+    ar_timeout = 1.0           # s without a tracking AR pose -> fall back to PDR
+    ar_yaw_alpha_game = 0.05   # EMA per AR frame, ARCore->game yaw (stable, fast)
+    ar_yaw_alpha_mag = 0.0005  # EMA per AR frame (~70 s), ARCore->ENU yaw from magnetometer (no "qg")
+    ar_yaw_fast_frames = 30    # after a jump, adapt quickly for this many frames
+    north_tau = 60.0           # s, smoothing of game->ENU yaw (magnetometer, disturbed indoors)
 
 
 class Fusion:
@@ -122,9 +132,14 @@ class Fusion:
         self.heading = None          # deg, 0 = North, 90 = East
         self._gps_moving_until = -1.0
         # AR
-        self._ar_hist = deque()      # (t_ar, p_ar np.array) in ARCore world frame
         self._ar_last_n = None
-        self._ar_yaw_cs = None       # smoothed (cos, sin) of ARCore->ENU yaw
+        self._ar_prev = None         # (t_ar, p_ar) of the previous camera frame
+        self._anc = None             # (filter position, p_ar, t_ar) at the anchor
+        self._yaw_a = None           # smoothed (cos, sin): ARCore->game (with qg) or ARCore->ENU
+        self._yaw_n = None           # smoothed (cos, sin): game->ENU (magnetometer north)
+        self._yaw_fast = 0
+        self.ar_jumps = 0
+        self.n_ar_frames = 0
         self.ar_last_t = None        # packet time of the last used AR pose
         self.ar_state = None
 
@@ -214,53 +229,105 @@ class Fusion:
                 w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
                 w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
 
+    @staticmethod
+    def _yaw_cs(C):
+        """(cos, sin) of the rotation about Up contained in C, or None if C is not ~vertical."""
+        up = quat_rotate(C, (0.0, 1.0, 0.0))
+        if up[2] < 0.9:
+            return None
+        v = quat_rotate(C, (1.0, 0.0, 0.0))
+        n = math.hypot(v[0], v[1]) or 1.0
+        return np.array([v[0] / n, v[1] / n])
+
+    @staticmethod
+    def _ema_cs(cur, new, alpha):
+        if cur is None:
+            return new
+        m = cur + alpha * (new - cur)
+        return m / (np.linalg.norm(m) or 1.0)
+
+    def _north(self, q, qg, dt):
+        """Slowly track the game->ENU yaw (game frame has arbitrary heading, ENU is North-up)."""
+        if q is None or qg is None or dt <= 0:
+            return
+        w, x, y, z = qg
+        D = self._qmul(q, (w, -x, -y, -z))        # game world -> ENU, rotation about Up
+        v = quat_rotate(D, (1.0, 0.0, 0.0))
+        n = math.hypot(v[0], v[1])
+        if n < 0.5:
+            return
+        cs = np.array([v[0] / n, v[1] / n])
+        self._yaw_n = self._ema_cs(self._yaw_n, cs, min(1.0, dt / self.prm.north_tau)
+                                   if self._yaw_n is not None else 1.0)
+
+    def _ar_rot(self):
+        """(cos, sin) of the full ARCore->ENU yaw (axis swap applied separately)."""
+        c1, s1 = self._yaw_a
+        if self._yaw_n is None:
+            return c1, s1
+        c2, s2 = self._yaw_n
+        return c1 * c2 - s1 * s2, s1 * c2 + c1 * s2
+
     def _ar_to_enu(self, v):
-        """ARCore world (X, Y=up, Z) -> ENU using the smoothed yaw."""
-        c, s_ = self._ar_yaw_cs
+        """ARCore world vector (X, Y=up, Z) -> ENU."""
+        c, s_ = self._ar_rot()
         x, y, z = v[0], -v[2], v[1]          # axis swap: Y-up -> Z-up
         return np.array([c * x - s_ * y, s_ * x + c * y, z])
 
-    def _ar(self, t, q_enu, ar):
-        """Use an ARCore pose; returns True if a velocity update was applied."""
+    def _ar(self, t, q_enu, ar, qg=None):
+        """Use an ARCore pose as an anchored position measurement. Returns True if applied."""
         self.ar_state = ar.get("st")
         if ar.get("st") != "TRACKING" or "p" not in ar or "q" not in ar:
-            self._ar_hist.clear()
+            self._anc = None
+            self._ar_prev = None
             return False
         if ar.get("n") == self._ar_last_n:
             return False
         self._ar_last_n = ar.get("n")
         t_ar = ar.get("ts", t * 1000.0) / 1000.0
         p_ar = np.array(ar["p"], dtype=float)
-        # yaw between ARCore world and ENU from the two orientation estimates of the same device:
-        # C = q_enu * conj(q_ar) maps ARCore-world -> ENU (should be axis swap + rotation about Up)
-        if q_enu is not None:
-            w, x, y, z = ar["q"]
-            C = self._qmul(q_enu, (w, -x, -y, -z))
-            up = quat_rotate(C, (0.0, 1.0, 0.0))
-            if up[2] > 0.9:
-                v = quat_rotate(C, (1.0, 0.0, 0.0))
-                yaw = math.atan2(v[1], v[0])
-                cs = np.array([math.cos(yaw), math.sin(yaw)])
-                if self._ar_yaw_cs is None:
-                    self._ar_yaw_cs = cs
+        w, x, y, z = ar["q"]
+        q_ar_conj = (w, -x, -y, -z)
+
+        # tracking jump (re-localisation) between consecutive frames -> new anchor, re-learn yaw
+        jumped = False
+        if self._ar_prev is not None:
+            dt_ar = max(t_ar - self._ar_prev[0], 1 / 30.0)
+            if np.linalg.norm(p_ar - self._ar_prev[1]) / dt_ar > self.prm.ar_max_speed and dt_ar < 0.5:
+                jumped = True
+                self.ar_jumps += 1
+                self._yaw_fast = self.prm.ar_yaw_fast_frames
+        self._ar_prev = (t_ar, p_ar)
+
+        # ARCore -> game (if qg) or ARCore -> ENU yaw
+        ref = qg if qg is not None else q_enu
+        if ref is not None:
+            cs = self._yaw_cs(self._qmul(ref, q_ar_conj))
+            if cs is not None:
+                if self._yaw_fast > 0:
+                    alpha = 0.3
+                    self._yaw_fast -= 1
                 else:
-                    m = self._ar_yaw_cs + self.prm.ar_yaw_alpha * (cs - self._ar_yaw_cs)
-                    self._ar_yaw_cs = m / (np.linalg.norm(m) or 1.0)
-        if self._ar_yaw_cs is None:
+                    alpha = self.prm.ar_yaw_alpha_game if qg is not None else self.prm.ar_yaw_alpha_mag
+                if qg is None and self._yaw_a is not None and self.n_ar_frames < 90:
+                    alpha = max(alpha, 0.05)    # learn the initial alignment quickly
+                self._yaw_a = self._ema_cs(self._yaw_a, cs, alpha)
+        if self._yaw_a is None:
             return False
-        self._ar_hist.append((t_ar, p_ar))
-        while len(self._ar_hist) > 2 and t_ar - self._ar_hist[1][0] >= self.prm.ar_window:
-            self._ar_hist.popleft()
-        t0, p0 = self._ar_hist[0]
-        if t_ar - t0 < self.prm.ar_window * 0.8:
+        self.n_ar_frames += 1
+
+        if self._anc is None or jumped:
+            self._anc = (self.x[0:3].copy(), p_ar, t_ar)
             self.ar_last_t = t
             return False
-        v = self._ar_to_enu((p_ar - p0) / (t_ar - t0))
-        if np.linalg.norm(v) > self.prm.ar_max_speed:   # tracking jump / relocalisation
-            self._ar_hist.clear()
-            return False
-        H = np.zeros((3, 9)); H[:, 3:6] = np.eye(3)
-        self._update(H, v, np.eye(3) * self.prm.ar_vel_sigma ** 2)
+        anc_x, anc_p, anc_t = self._anc
+        d = self._ar_to_enu(p_ar - anc_p)
+        z = anc_x + d
+        sig = self.prm.ar_pos_sigma + self.prm.ar_pos_sigma_rel * float(np.linalg.norm(d))
+        H = np.zeros((3, 9)); H[:, 0:3] = np.eye(3)
+        self._update(H, z, np.eye(3) * sig * sig, gate=False)
+        if t_ar - anc_t >= self.prm.ar_anchor_period:
+            self._anc = (self.x[0:3].copy(), p_ar, t_ar)
         self.ar_last_t = t
         return True
 
@@ -307,9 +374,14 @@ class Fusion:
             self._update(H, np.zeros(3), np.eye(3) * self.prm.zupt_sigma ** 2, gate=False)
 
         # camera VIO (ARCore)
+        qg = pkt.get("qg")
+        if qg is not None:
+            n = math.sqrt(sum(c * c for c in qg)) or 1.0
+            qg = [c / n for c in qg]
+            self._north(q, qg, dt)
         ar = pkt.get("ar")
         if self.prm.ar and ar:
-            self._ar(t, q, ar)
+            self._ar(t, q, ar, qg)
 
         # pedestrian dead reckoning (skipped while camera tracking is available)
         if self.prm.pdr and q is not None and lin is not None and not self.ar_tracking:
@@ -372,6 +444,8 @@ class Fusion:
             H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
             self._update(H, zv, np.eye(2) * self.prm.gps_vel_sigma ** 2)
         self.jump += self.x[0:3] - before
+        if self._anc is not None:   # keep camera displacement measurements consistent with GPS
+            self._anc = (self._anc[0] + (self.x[0:3] - before), self._anc[1], self._anc[2])
         if self.last_gps_wall is not None:
             gap = min(t - self.last_gps_wall, 30.0)
             self.gps_interval += 0.2 * (gap - self.gps_interval)
