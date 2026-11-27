@@ -48,6 +48,21 @@ python pc_viewer/viewer.py
 netsh advfirewall firewall delete rule name=SmartLogger-UDP-5005
 ```
 
+#### データが届かないとき（ESET などのセキュリティソフト）
+
+ESET などのファイアウォールが入っている PC では、Windows ファイアウォールのルールが使われず、スマホからの UDP が捨てられることがあります。
+その場合は `--phone` にスマホの IP を指定してください（スマホのアプリ画面の `this phone:` に表示されます）。
+
+```powershell
+python pc_viewer/viewer.py --phone 192.168.128.187
+```
+
+ビューアが 1 秒ごとにスマホへ「呼びかけ」パケット（`SMARTLOGGER_HELLO`）を送り、アプリはその送り元へデータを返します。
+PC から始めた通信への返信になるので、受信を止めるファイアウォールでも通ります（アプリ画面に `sending to: ... (PC hello)` と表示されます）。
+呼びかけが 5 秒途切れると、アプリは **PC IP address** の宛先へ送る通常の動作に戻ります。
+
+スマホを ADB で接続していれば `--phone adb` で IP を自動取得できます。
+
 オプション:
 
 | オプション | 既定 | 説明 |
@@ -58,6 +73,7 @@ netsh advfirewall firewall delete rule name=SmartLogger-UDP-5005
 | `--smooth` | 4 | 位置の平滑化レート [1/s] |
 | `--accel-scale` | 0.3 | 加速度矢印の長さ [m per m/s²] |
 | `--no-firewall` | - | 起動時のファイアウォール確認をしない |
+| `--phone` | - | スマホの `IP[:ポート]` へ呼びかけを送る（`adb` で自動取得） |
 
 操作: 左ドラッグ = 視点回転 / ホイール = ズーム / `F` = 追従 ON/OFF / `R` = 原点リセット / `T` = 軌跡表示 / `A` = 加速度矢印 / `Esc` = 終了
 

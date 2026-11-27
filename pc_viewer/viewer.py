@@ -39,12 +39,18 @@ EARTH_R = 6378137.0
 class Receiver(threading.Thread):
     """Background UDP listener that keeps the latest packet and a packet-rate estimate."""
 
-    def __init__(self, port: int):
+    HELLO = b"SMARTLOGGER_HELLO"
+
+    def __init__(self, port: int, phone: str = None):
         super().__init__(daemon=True)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", port))
         self.sock.settimeout(0.5)
+        self.phone = None
+        if phone:
+            host, _, pport = phone.partition(":")
+            self.phone = (host, int(pport) if pport else port)
         self.lock = threading.Lock()
         self.latest = None
         self.sender = None
@@ -56,11 +62,29 @@ class Receiver(threading.Thread):
         self.new_gps = deque(maxlen=50)
         self._last_gps_t = None
 
+    def _hello_loop(self):
+        """Periodically say hello to the phone from the receive socket.
+
+        The phone replies to this address/port, so the data is a reply to a PC-initiated
+        flow and passes stateful firewalls (ESET etc.) that drop unsolicited inbound UDP.
+        """
+        while True:
+            try:
+                self.sock.sendto(self.HELLO, self.phone)
+            except OSError:
+                pass
+            time.sleep(1.0)
+
     def run(self):
+        if self.phone:
+            threading.Thread(target=self._hello_loop, daemon=True).start()
         while True:
             try:
                 data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows reports ICMP "port unreachable" (app not started yet) as a reset; ignore it.
                 continue
             except OSError:
                 return
@@ -189,7 +213,7 @@ class Viewer(ShowBase):
         loadPrcFileData("", "window-title SmartLogger 3D Viewer\nwin-size 1280 800\nframebuffer-multisample 1\nmultisamples 4\nsync-video 1")
         super().__init__()
         self.args = args
-        self.rx = Receiver(args.port)
+        self.rx = Receiver(args.port, args.phone)
         self.rx.start()
 
         self.setBackgroundColor(0.08, 0.08, 0.1, 1)
@@ -411,7 +435,7 @@ class Viewer(ShowBase):
         return task.cont
 
     def _hud_text(self, pkt, sender, last_rx, rate, height_src, lin_w):
-        lines = [f"UDP :{self.args.port}"]
+        lines = [f"UDP :{self.args.port}" + (f"  hello->{self.args.phone}" if self.args.phone else "")]
         if pkt is None:
             lines.append("waiting for packets...")
             return "\n".join(lines)
@@ -495,6 +519,19 @@ def ensure_firewall(port):
             MB_ICONWARN | MB_TOPMOST)
 
 
+def phone_ip_from_adb():
+    """Return the Wi-Fi IPv4 address of the ADB-connected phone, or None."""
+    import re
+    try:
+        out = subprocess.run(["adb", "shell", "ip", "-4", "addr", "show", "wlan0"], capture_output=True,
+                             text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="SmartLogger real-time 3D viewer")
     ap.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default 5005)")
@@ -504,7 +541,13 @@ def main():
     ap.add_argument("--accel-scale", type=float, default=0.3, help="metres per m/s2 for accel arrow")
     ap.add_argument("--grid", type=float, default=100, help="half size of ground grid in metres")
     ap.add_argument("--no-firewall", action="store_true", help="skip the Windows firewall check")
+    ap.add_argument("--phone", default=None,
+                    help="phone IP[:port] to send hello to (needed behind ESET-like firewalls); "
+                         "'adb' = detect the IP via ADB. Port defaults to --port")
     args = ap.parse_args()
+    if args.phone == "adb":
+        args.phone = phone_ip_from_adb()
+        print(f"[adb] phone IP: {args.phone}")
     if not args.no_firewall:
         ensure_firewall(args.port)
     Viewer(args).run()

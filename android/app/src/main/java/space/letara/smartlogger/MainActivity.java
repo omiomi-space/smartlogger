@@ -25,8 +25,12 @@ import android.widget.TextView;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -50,8 +54,12 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
     private final Handler ui = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService sender;
     private volatile DatagramSocket socket;
-    private volatile InetAddress target;
-    private volatile int targetPort;
+    private volatile InetSocketAddress target;      // configured destination
+    private volatile InetSocketAddress helloTarget; // PC that sent us a hello (takes priority)
+    private volatile long lastHelloMs = 0;
+    private Thread helloThread;
+    private static final String HELLO = "SMARTLOGGER_HELLO";
+    private static final long HELLO_TIMEOUT_MS = 5000;
     private volatile boolean running = false;
     private long seq = 0;
     private volatile String lastError = null;
@@ -164,18 +172,72 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         lastError = null;
         startButton.setText("STOP");
         sender = Executors.newSingleThreadScheduledExecutor();
+        helloTarget = null;
         sender.execute(() -> {
             try {
-                target = InetAddress.getByName(host);
-                targetPort = port;
-                DatagramSocket s = new DatagramSocket();
+                // Bind to the same port so a PC can "hello" us; replies to a PC-initiated flow
+                // pass through stateful PC firewalls (e.g. ESET) that drop unsolicited UDP.
+                DatagramSocket s = new DatagramSocket(null);
+                s.setReuseAddress(true);
+                try {
+                    s.bind(new InetSocketAddress(port));
+                } catch (Exception bindErr) {
+                    s.close();
+                    s = new DatagramSocket();
+                    lastError = "port " + port + " busy; hello mode disabled";
+                }
                 s.setBroadcast(true);
                 socket = s;
+                startHelloListener(s);
+                target = new InetSocketAddress(InetAddress.getByName(host), port);
             } catch (Exception e) {
                 lastError = "socket: " + e.getMessage();
             }
         });
         sender.scheduleAtFixedRate(this::sendPacket, 100, Math.max(1, 1000L / rate), TimeUnit.MILLISECONDS);
+    }
+
+    private void startHelloListener(final DatagramSocket s) {
+        helloThread = new Thread(() -> {
+            byte[] buf = new byte[256];
+            while (running && !s.isClosed()) {
+                try {
+                    DatagramPacket p = new DatagramPacket(buf, buf.length);
+                    s.receive(p);
+                    String msg = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
+                    if (msg.startsWith(HELLO)) {
+                        helloTarget = new InetSocketAddress(p.getAddress(), p.getPort());
+                        lastHelloMs = System.currentTimeMillis();
+                    }
+                } catch (Exception e) {
+                    if (s.isClosed()) return;
+                }
+            }
+        }, "hello-listener");
+        helloThread.setDaemon(true);
+        helloThread.start();
+    }
+
+    private InetSocketAddress currentTarget() {
+        InetSocketAddress h = helloTarget;
+        if (h != null && System.currentTimeMillis() - lastHelloMs < HELLO_TIMEOUT_MS) return h;
+        return target;
+    }
+
+    private static String localIps() {
+        StringBuilder b = new StringBuilder();
+        try {
+            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                    if (a instanceof Inet4Address) {
+                        if (b.length() > 0) b.append(", ");
+                        b.append(a.getHostAddress()).append(" (").append(ni.getName()).append(')');
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return b.length() == 0 ? "-" : b.toString();
     }
 
     private void stopStreaming() {
@@ -239,11 +301,11 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
 
     private void sendPacket() {
         DatagramSocket s = socket;
-        InetAddress addr = target;
-        if (!running || s == null || addr == null) return;
+        InetSocketAddress dst = currentTarget();
+        if (!running || s == null || dst == null) return;
         byte[] data = buildJson().getBytes(StandardCharsets.UTF_8);
         try {
-            s.send(new DatagramPacket(data, data.length, addr, targetPort));
+            s.send(new DatagramPacket(data, data.length, dst));
         } catch (Exception e) {
             lastError = "send: " + e.getMessage();
         }
@@ -346,6 +408,13 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         StringBuilder b = new StringBuilder();
         b.append(running ? "STREAMING" : "stopped").append("   packets: ").append(seq).append('\n');
         if (lastError != null) b.append("ERROR: ").append(lastError).append('\n');
+        b.append("this phone: ").append(localIps()).append('\n');
+        if (running) {
+            InetSocketAddress dst = currentTarget();
+            boolean viaHello = dst != null && dst == helloTarget;
+            b.append("sending to: ").append(dst == null ? "-" : dst.getAddress().getHostAddress() + ":" + dst.getPort())
+                    .append(viaHello ? "  (PC hello)" : "").append('\n');
+        }
         b.append("orientation src: ").append(quatSource).append('\n');
         b.append(String.format(Locale.US, "q   w%+.3f x%+.3f y%+.3f z%+.3f\n", quat[0], quat[1], quat[2], quat[3]));
         b.append(String.format(Locale.US, "acc %+7.2f %+7.2f %+7.2f m/s2\n", acc[0], acc[1], acc[2]));
