@@ -30,6 +30,7 @@ import numpy as np
 
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
+from discovery import Discovery
 from fusion import Fusion
 from panda3d.core import (
     AmbientLight, DirectionalLight, GeomNode, LineSegs, NodePath, Quat, TextNode,
@@ -45,22 +46,32 @@ class Receiver(threading.Thread):
 
     HELLO = b"SMARTLOGGER_HELLO"
 
-    def __init__(self, port: int, phone: str = None, alt_source: str = "baro"):
+    def __init__(self, port: int, phone: str = None, alt_source: str = "baro", phone_port: int = None):
         super().__init__(daemon=True)
         self.fusion = Fusion()
         self.alt_source = alt_source
         self._new_fix_points = []
         self.record = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows would otherwise let a second viewer share the port and steal half the packets
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(("0.0.0.0", port))
         self.sock.settimeout(0.5)
+        # how to find the phone: "auto" (network discovery), "adb", "none" or a fixed IP[:port]
+        phone = phone or "auto"
+        self.phone_mode = phone if phone in ("auto", "adb", "none") else "ip"
+        self.phone_auto = self.phone_mode == "adb"
         self.phone = None
-        self.phone_auto = phone == "adb"      # find (and keep re-finding) the phone IP via ADB
-        self.port = port
-        if phone and not self.phone_auto:
+        self.port = phone_port or port        # the app's UDP port (hello destination)
+        self.discovery = Discovery()
+        self.discovery_status = ""
+        if self.phone_mode == "ip":
             host, _, pport = phone.partition(":")
-            self.phone = (host, int(pport) if pport else port)
+            self.phone = (host, int(pport) if pport else self.port)
         self.lock = threading.Lock()
         self.latest = None
         self.sender = None
@@ -79,8 +90,19 @@ class Receiver(threading.Thread):
         flow and passes stateful firewalls (ESET etc.) that drop unsolicited inbound UDP.
         """
         next_lookup = 0.0
+        next_discovery = 0.0
         while True:
             now = time.time()
+            quiet = now - self.last_rx > 3.0
+            # network discovery: while nothing arrives, hello broadcast / ARP neighbours / sweep
+            if self.phone_mode == "auto" and quiet and now >= next_discovery:
+                for ip in self.discovery.targets():
+                    try:
+                        self.sock.sendto(self.HELLO, (ip, self.port))
+                    except OSError:
+                        pass
+                self.discovery_status = self.discovery.status
+                next_discovery = now + 2.0
             # with --phone adb: look the IP up again if we have none or the stream went quiet
             if self.phone_auto and now >= next_lookup and (self.phone is None or now - self.last_rx > 5.0):
                 ip = phone_ip_from_adb()
@@ -97,7 +119,7 @@ class Receiver(threading.Thread):
             time.sleep(1.0)
 
     def run(self):
-        if self.phone or self.phone_auto:
+        if self.phone_mode != "none":
             threading.Thread(target=self._hello_loop, daemon=True).start()
         while True:
             try:
@@ -125,6 +147,10 @@ class Receiver(threading.Thread):
                     self._last_seq = seq
                 self.latest = pkt
                 self.sender = addr
+                if self.phone_mode == "auto" and self.phone != addr:
+                    self.phone = addr          # lock onto the device that answered
+                    self.discovery_status = ""
+                    print(f"[discovery] phone found at {addr[0]}:{addr[1]}")
                 self.last_rx = now
                 self.count += 1
                 self._stamps.append(now)
@@ -261,7 +287,7 @@ class Viewer(ShowBase):
         loadPrcFileData("", "window-title SmartLogger 3D Viewer\nwin-size 1280 800\nframebuffer-multisample 1\nmultisamples 4\nsync-video 1")
         super().__init__()
         self.args = args
-        self.rx = Receiver(args.port, args.phone, args.alt)
+        self.rx = Receiver(args.port, args.phone, args.alt, getattr(args, "phone_port", None))
         if getattr(args, "record", None):
             self.rx.record = open(args.record, "a", encoding="utf-8", buffering=1)
         self.rx.start()
@@ -510,6 +536,8 @@ class Viewer(ShowBase):
             hello = f"  hello->{ph[0]}:{ph[1]}"
         elif self.rx.phone_auto:
             hello = "  hello: phone IP not found via ADB (adb devices?)"
+        if self.rx.phone_mode == "auto" and self.rx.discovery_status and pkt is None:
+            hello = "  " + self.rx.discovery_status
         lines = [f"UDP :{self.args.port}" + hello]
         if pkt is None:
             lines.append("waiting for packets...")
@@ -641,13 +669,25 @@ def main():
     ap.add_argument("--accel-scale", type=float, default=0.3, help="metres per m/s2 for accel arrow")
     ap.add_argument("--grid", type=float, default=100, help="half size of ground grid in metres")
     ap.add_argument("--no-firewall", action="store_true", help="skip the Windows firewall check")
+    ap.add_argument("--phone-port", type=int, default=None, help="the app's UDP port if different from --port")
     ap.add_argument("--record", default=None, help="append every received packet to this JSONL file")
-    ap.add_argument("--phone", default=None,
-                    help="phone IP[:port] to send hello to (needed behind ESET-like firewalls); "
-                         "'adb' = detect the IP via ADB. Port defaults to --port")
+    ap.add_argument("--phone", default="auto",
+                    help="how to reach the phone (needed behind ESET-like firewalls): 'auto' = search the "
+                         "LAN (broadcast, ARP table, subnet sweep; default), 'adb' = IP via ADB, "
+                         "'none' = only listen, or a fixed IP[:port]")
     args = ap.parse_args()
     if not args.no_firewall:
         ensure_firewall(args.port)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(("0.0.0.0", args.port))
+    except OSError:
+        sys.exit(f"UDP port {args.port} is already in use - is another viewer.py still running? "
+                 f"Close it or use --port.")
+    finally:
+        probe.close()
     Viewer(args).run()
 
 
