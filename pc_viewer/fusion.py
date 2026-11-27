@@ -76,11 +76,14 @@ class FusionParams:
     step_lp_hz = 4.0           # low-pass of vertical world accel for step detection
     step_thresh = 0.8          # min. peak of vertical accel for a step [m/s^2]
     step_min_interval = 0.33   # s
-    step_k = 0.45              # Weinberg step length: K * (amax - amin)^(1/4)
+    step_k = 0.52              # Weinberg step length: K * (amax - amin)^(1/4)
     step_len_min = 0.3
     step_len_max = 1.1
     pdr_vel_sigma = 0.25       # m/s
     step_timeout = 1.2         # s without a step -> standing
+    step_cal = True            # learn a step-length scale from the camera while it tracks
+    step_cal_dist = 5.0        # m of (uncalibrated) step length per calibration batch
+    step_cal_alpha = 0.3       # EMA weight per batch
     standing_sigma = 0.15      # m/s
     # camera visual-inertial odometry (ARCore)
     ar = True
@@ -131,6 +134,10 @@ class Fusion:
         self.step_len = 0.0
         self.heading = None          # deg, 0 = North, 90 = East
         self._gps_moving_until = -1.0
+        self.step_scale = 1.0        # learned from the camera (ARCore) while it tracks
+        self._step_pos = None        # filter position at the previous step
+        self._cal_disp = 0.0
+        self._cal_len = 0.0
         # AR
         self._ar_last_n = None
         self._ar_prev = None         # (t_ar, p_ar) of the previous camera frame
@@ -190,8 +197,12 @@ class Fusion:
             self._quiet.popleft()
         self.still = (t - self._quiet[0]) >= self.prm.still_window
 
-    def _pdr(self, t, dt, q, a):
-        """Step detection on vertical world accel; returns True if a step was detected."""
+    def _pdr(self, t, dt, q, a, apply=True):
+        """Step detection on vertical world accel; returns True if a step was detected.
+
+        apply=False (camera tracking): only detect steps and calibrate the step length against
+        the camera-tracked displacement; no velocity update.
+        """
         alpha = 1.0 - math.exp(-2 * math.pi * self.prm.step_lp_hz * dt) if dt > 0 else 0.0
         self._lp2, self._lp1 = self._lp1, self._lp
         self._lp += alpha * (a[2] - self._lp)
@@ -206,9 +217,21 @@ class Fusion:
             return False
         period = 0.6 if self.last_step_t is None else min(max(t - self.last_step_t, 0.35), 1.0)
         rng = max(self._amax - self._amin, 0.0)
-        L = min(max(self.prm.step_k * rng ** 0.25, self.prm.step_len_min), self.prm.step_len_max)
+        L_raw = self.prm.step_k * rng ** 0.25
+        L = min(max(L_raw * self.step_scale, self.prm.step_len_min), self.prm.step_len_max)
+        pos = self.x[0:2].copy()
+        if not apply and self.prm.step_cal and self._step_pos is not None and period < 1.0:
+            disp = float(np.linalg.norm(pos - self._step_pos))
+            if 0.3 * period < disp < 2.5 * period:      # a plausible walking step
+                self._cal_disp += disp
+                self._cal_len += L_raw
+                if self._cal_len >= self.prm.step_cal_dist:
+                    ratio = min(max(self._cal_disp / self._cal_len, 0.5), 2.0)
+                    self.step_scale += self.prm.step_cal_alpha * (ratio - self.step_scale)
+                    self._cal_disp = self._cal_len = 0.0
+        self._step_pos = pos
         n = np.linalg.norm(self._fwd)
-        if n > 1e-6:
+        if n > 1e-6 and apply:
             d = self._fwd / n
             self.heading = math.degrees(math.atan2(d[0], d[1])) % 360
             H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
@@ -384,9 +407,10 @@ class Fusion:
             self._ar(t, q, ar, qg)
 
         # pedestrian dead reckoning (skipped while camera tracking is available)
-        if self.prm.pdr and q is not None and lin is not None and not self.ar_tracking:
-            self._pdr(t, dt, q, a)
-            if not self.walking and not self.still and t > self._gps_moving_until:
+        if self.prm.pdr and q is not None and lin is not None:
+            cam = self.ar_tracking
+            self._pdr(t, dt, q, a, apply=not cam)
+            if not cam and not self.walking and not self.still and t > self._gps_moving_until:
                 H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1
                 self._update(H, np.zeros(2), np.eye(2) * self.prm.standing_sigma ** 2, gate=False)
 

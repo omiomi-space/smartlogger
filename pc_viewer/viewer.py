@@ -177,7 +177,7 @@ class Receiver(threading.Thread):
                   "still": f.still, "gps_age": f.gps_age(), "gps_interval": f.gps_interval,
                   "new_fixes": list(self._new_fix_points),
                   "steps": f.steps, "step_len": f.step_len, "walking": f.walking, "heading": f.heading,
-                  "ar_state": f.ar_state, "ar_tracking": f.ar_tracking,
+                  "ar_state": f.ar_state, "ar_tracking": f.ar_tracking, "step_scale": f.step_scale,
                   "pos_sigma": float(np.sqrt(max(f.P[0, 0], f.P[1, 1])))}
             f.jump[:] = 0
             self._new_fix_points.clear()
@@ -577,7 +577,7 @@ class Viewer(ShowBase):
                          f"  {'STILL' if fs['still'] else ('WALKING' if fs['walking'] else 'standing')}")
             cam = "off" if fs["ar_state"] is None else fs["ar_state"]
             src = "CAMERA" if fs["ar_tracking"] else "PDR"
-            lines.append(f"motion src {src}  camera {cam}  steps {fs['steps']}  step {fs['step_len']:.2f} m")
+            lines.append(f"motion src {src}  camera {cam}  steps {fs['steps']}  step {fs['step_len']:.2f} m (x{fs['step_scale']:.2f} learned)")
             lines.append(f"mode {self.mode.upper()}  GPS {age_txt}  pos sigma {fs['pos_sigma']:.1f} m"
                          f"  bias {fs['bias'][0]:+.2f} {fs['bias'][1]:+.2f} {fs['bias'][2]:+.2f}")
         lines.append(f"follow {'on' if self.follow else 'off'}")
