@@ -56,7 +56,9 @@ class Receiver(threading.Thread):
         self.sock.bind(("0.0.0.0", port))
         self.sock.settimeout(0.5)
         self.phone = None
-        if phone:
+        self.phone_auto = phone == "adb"      # find (and keep re-finding) the phone IP via ADB
+        self.port = port
+        if phone and not self.phone_auto:
             host, _, pport = phone.partition(":")
             self.phone = (host, int(pport) if pport else port)
         self.lock = threading.Lock()
@@ -76,15 +78,26 @@ class Receiver(threading.Thread):
         The phone replies to this address/port, so the data is a reply to a PC-initiated
         flow and passes stateful firewalls (ESET etc.) that drop unsolicited inbound UDP.
         """
+        next_lookup = 0.0
         while True:
-            try:
-                self.sock.sendto(self.HELLO, self.phone)
-            except OSError:
-                pass
+            now = time.time()
+            # with --phone adb: look the IP up again if we have none or the stream went quiet
+            if self.phone_auto and now >= next_lookup and (self.phone is None or now - self.last_rx > 5.0):
+                ip = phone_ip_from_adb()
+                if ip:
+                    if self.phone is None or self.phone[0] != ip:
+                        print(f"[adb] phone IP: {ip}")
+                    self.phone = (ip, self.port)
+                next_lookup = now + 5.0
+            if self.phone:
+                try:
+                    self.sock.sendto(self.HELLO, self.phone)
+                except OSError:
+                    pass
             time.sleep(1.0)
 
     def run(self):
-        if self.phone:
+        if self.phone or self.phone_auto:
             threading.Thread(target=self._hello_loop, daemon=True).start()
         while True:
             try:
@@ -491,7 +504,13 @@ class Viewer(ShowBase):
         return task.cont
 
     def _hud_text(self, pkt, sender, last_rx, rate, height_src, lin_w):
-        lines = [f"UDP :{self.args.port}" + (f"  hello->{self.args.phone}" if self.args.phone else "")]
+        ph = self.rx.phone
+        hello = ""
+        if ph:
+            hello = f"  hello->{ph[0]}:{ph[1]}"
+        elif self.rx.phone_auto:
+            hello = "  hello: phone IP not found via ADB (adb devices?)"
+        lines = [f"UDP :{self.args.port}" + hello]
         if pkt is None:
             lines.append("waiting for packets...")
             return "\n".join(lines)
@@ -587,17 +606,28 @@ def ensure_firewall(port):
             MB_ICONWARN | MB_TOPMOST)
 
 
+def _adb(*args, timeout=10):
+    return subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+
+
 def phone_ip_from_adb():
-    """Return the Wi-Fi IPv4 address of the ADB-connected phone, or None."""
+    """Return the Wi-Fi IPv4 address of an ADB-connected phone, or None.
+
+    Works when several ADB entries exist (wireless debugging often lists the same phone twice,
+    which makes a plain `adb shell` fail with "more than one device").
+    """
     import re
     try:
-        out = subprocess.run(["adb", "shell", "ip", "-4", "addr", "show", "wlan0"], capture_output=True,
-                             text=True, timeout=10,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        serials = [ln.split()[0] for ln in _adb("devices").splitlines()[1:]
+                   if ln.strip() and ln.split()[-1] == "device"]
+        for serial in serials:
+            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", _adb("-s", serial, "shell", "ip", "-4", "addr", "show", "wlan0"))
+            if m:
+                return m.group(1)
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-    return m.group(1) if m else None
+        pass
+    return None
 
 
 def main():
@@ -616,9 +646,6 @@ def main():
                     help="phone IP[:port] to send hello to (needed behind ESET-like firewalls); "
                          "'adb' = detect the IP via ADB. Port defaults to --port")
     args = ap.parse_args()
-    if args.phone == "adb":
-        args.phone = phone_ip_from_adb()
-        print(f"[adb] phone IP: {args.phone}")
     if not args.no_firewall:
         ensure_firewall(args.port)
     Viewer(args).run()
