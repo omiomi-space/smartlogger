@@ -17,7 +17,7 @@ from fusion import Fusion
 from simulate_sender import generate
 
 
-def run(duration, gps_rate, seed, rate=50.0):
+def run(duration, gps_rate, seed, rate=50.0, ar=False):
     f = Fusion()
     hold = None
     lerp = np.zeros(2)
@@ -26,7 +26,7 @@ def run(duration, gps_rate, seed, rate=50.0):
     origin_truth = None
     k_lerp = 1.0 - math.exp(-4.0 / rate)
     last_gps_t = None
-    for p_true, pkt in generate(duration, rate, gps_rate, seed=seed, t0_ms=0):
+    for p_true, pkt in generate(duration, rate, gps_rate, seed=seed, t0_ms=0, ar=ar):
         f.process(pkt)
         if f.origin is None:
             continue
@@ -52,10 +52,11 @@ def main():
     ap.add_argument("--duration", type=float, default=300)
     ap.add_argument("--gps-rate", type=float, default=1.0)
     ap.add_argument("--seeds", type=int, default=5)
+    ap.add_argument("--ar", action="store_true", help="simulate ARCore camera tracking too")
     args = ap.parse_args()
     tot = {}
     for s in range(args.seeds):
-        res, z = run(args.duration, args.gps_rate, s + 1)
+        res, z = run(args.duration, args.gps_rate, s + 1, ar=args.ar)
         line = "  ".join(f"{k}: rms {v[0]:5.2f} p95 {v[1]:5.2f}" for k, v in res.items())
         print(f"seed {s + 1}: {line}  | height rms {z:.2f} m")
         for k, v in res.items():

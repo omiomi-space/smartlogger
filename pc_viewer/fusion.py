@@ -21,6 +21,8 @@ Updates:
                            direction the phone is pointing (pedestrian dead reckoning)
   standing (v_EN = 0)      no step for a while (hand-held phone is never perfectly still)
   weak velocity damping    when GPS is stale and PDR is off, so integration cannot run away
+  camera VIO velocity      ARCore pose (if the app sends "ar"): velocity over ~0.25 s windows,
+                           rotated from ARCore's world frame into ENU; replaces PDR while tracking
 
 Double-integrating a hand-held phone's acceleration alone drifts within seconds, so for
 walking the step-based PDR velocity is what carries the position between GPS fixes.
@@ -74,6 +76,13 @@ class FusionParams:
     pdr_vel_sigma = 0.25       # m/s
     step_timeout = 1.2         # s without a step -> standing
     standing_sigma = 0.15      # m/s
+    # camera visual-inertial odometry (ARCore)
+    ar = True
+    ar_window = 0.25           # s, velocity is computed over this window of AR poses
+    ar_vel_sigma = 0.08        # m/s
+    ar_yaw_alpha = 0.02        # EMA weight per AR frame for the ARCore->ENU yaw
+    ar_max_speed = 6.0         # m/s; faster = relocalisation jump, ignored
+    ar_timeout = 0.5           # s without a tracking AR pose -> fall back to PDR
 
 
 class Fusion:
@@ -112,6 +121,12 @@ class Fusion:
         self.step_len = 0.0
         self.heading = None          # deg, 0 = North, 90 = East
         self._gps_moving_until = -1.0
+        # AR
+        self._ar_hist = deque()      # (t_ar, p_ar np.array) in ARCore world frame
+        self._ar_last_n = None
+        self._ar_yaw_cs = None       # smoothed (cos, sin) of ARCore->ENU yaw
+        self.ar_last_t = None        # packet time of the last used AR pose
+        self.ar_state = None
 
     # ------------------------------------------------------------------ helpers
     def enu(self, lat, lon):
@@ -190,6 +205,70 @@ class Fusion:
         self._fwd[:] = 0
         return True
 
+    @staticmethod
+    def _qmul(a, b):
+        w1, x1, y1, z1 = a
+        w2, x2, y2, z2 = b
+        return (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+
+    def _ar_to_enu(self, v):
+        """ARCore world (X, Y=up, Z) -> ENU using the smoothed yaw."""
+        c, s_ = self._ar_yaw_cs
+        x, y, z = v[0], -v[2], v[1]          # axis swap: Y-up -> Z-up
+        return np.array([c * x - s_ * y, s_ * x + c * y, z])
+
+    def _ar(self, t, q_enu, ar):
+        """Use an ARCore pose; returns True if a velocity update was applied."""
+        self.ar_state = ar.get("st")
+        if ar.get("st") != "TRACKING" or "p" not in ar or "q" not in ar:
+            self._ar_hist.clear()
+            return False
+        if ar.get("n") == self._ar_last_n:
+            return False
+        self._ar_last_n = ar.get("n")
+        t_ar = ar.get("ts", t * 1000.0) / 1000.0
+        p_ar = np.array(ar["p"], dtype=float)
+        # yaw between ARCore world and ENU from the two orientation estimates of the same device:
+        # C = q_enu * conj(q_ar) maps ARCore-world -> ENU (should be axis swap + rotation about Up)
+        if q_enu is not None:
+            w, x, y, z = ar["q"]
+            C = self._qmul(q_enu, (w, -x, -y, -z))
+            up = quat_rotate(C, (0.0, 1.0, 0.0))
+            if up[2] > 0.9:
+                v = quat_rotate(C, (1.0, 0.0, 0.0))
+                yaw = math.atan2(v[1], v[0])
+                cs = np.array([math.cos(yaw), math.sin(yaw)])
+                if self._ar_yaw_cs is None:
+                    self._ar_yaw_cs = cs
+                else:
+                    m = self._ar_yaw_cs + self.prm.ar_yaw_alpha * (cs - self._ar_yaw_cs)
+                    self._ar_yaw_cs = m / (np.linalg.norm(m) or 1.0)
+        if self._ar_yaw_cs is None:
+            return False
+        self._ar_hist.append((t_ar, p_ar))
+        while len(self._ar_hist) > 2 and t_ar - self._ar_hist[1][0] >= self.prm.ar_window:
+            self._ar_hist.popleft()
+        t0, p0 = self._ar_hist[0]
+        if t_ar - t0 < self.prm.ar_window * 0.8:
+            self.ar_last_t = t
+            return False
+        v = self._ar_to_enu((p_ar - p0) / (t_ar - t0))
+        if np.linalg.norm(v) > self.prm.ar_max_speed:   # tracking jump / relocalisation
+            self._ar_hist.clear()
+            return False
+        H = np.zeros((3, 9)); H[:, 3:6] = np.eye(3)
+        self._update(H, v, np.eye(3) * self.prm.ar_vel_sigma ** 2)
+        self.ar_last_t = t
+        return True
+
+    @property
+    def ar_tracking(self):
+        return self.ar_last_t is not None and self.last_t is not None and \
+            self.last_t - self.ar_last_t < self.prm.ar_timeout
+
     @property
     def walking(self):
         return self.last_step_t is not None and self.last_t is not None and             self.last_t - self.last_step_t < self.prm.step_timeout
@@ -227,8 +306,13 @@ class Fusion:
             H = np.zeros((3, 9)); H[:, 3:6] = np.eye(3)
             self._update(H, np.zeros(3), np.eye(3) * self.prm.zupt_sigma ** 2, gate=False)
 
-        # pedestrian dead reckoning
-        if self.prm.pdr and q is not None and lin is not None:
+        # camera VIO (ARCore)
+        ar = pkt.get("ar")
+        if self.prm.ar and ar:
+            self._ar(t, q, ar)
+
+        # pedestrian dead reckoning (skipped while camera tracking is available)
+        if self.prm.pdr and q is not None and lin is not None and not self.ar_tracking:
             self._pdr(t, dt, q, a)
             if not self.walking and not self.still and t > self._gps_moving_until:
                 H = np.zeros((2, 9)); H[0, 3] = 1; H[1, 4] = 1

@@ -12,12 +12,14 @@ import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -43,6 +45,7 @@ import java.util.concurrent.TimeUnit;
 public class MainActivity extends Activity implements SensorEventListener, LocationListener {
 
     private static final int REQ_LOCATION = 1;
+    private static final int REQ_CAMERA = 2;
 
     private SensorManager sensorManager;
     private LocationManager locationManager;
@@ -50,6 +53,9 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
     private EditText hostEdit, portEdit, rateEdit;
     private Button startButton;
     private TextView statusView;
+    private CheckBox arCheck;
+    private ArTracker ar;
+    private boolean arActive = false;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService sender;
@@ -128,6 +134,14 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         });
         root.addView(startButton);
 
+        arCheck = new CheckBox(this);
+        arCheck.setText("Use camera for position (ARCore VIO)\n- point the back camera forward, not at the floor/ceiling");
+        arCheck.setChecked(prefs.getBoolean("ar", true));
+        root.addView(arCheck);
+        GLSurfaceView glView = new GLSurfaceView(this);
+        root.addView(glView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(24)));
+        ar = new ArTracker(this, glView);
+
         statusView = new TextView(this);
         statusView.setTypeface(Typeface.MONOSPACE);
         statusView.setTextSize(12);
@@ -163,10 +177,12 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
             return;
         }
         getPreferences(MODE_PRIVATE).edit()
-                .putString("host", host).putInt("port", port).putInt("rate", rate).apply();
+                .putString("host", host).putInt("port", port).putInt("rate", rate)
+                .putBoolean("ar", arCheck.isChecked()).apply();
 
         registerSensors(rate);
         startLocation();
+        if (arCheck.isChecked()) startAr();
 
         running = true;
         lastError = null;
@@ -240,8 +256,37 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         return b.length() == 0 ? "-" : b.toString();
     }
 
+    private void startAr() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+            return;
+        }
+        String err = ar.start();
+        arActive = err == null;
+        if (err != null) lastError = err;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (running && arCheck.isChecked() && !arActive) startAr();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (arActive) {
+            ar.stop();
+            arActive = false;
+        }
+    }
+
     private void stopStreaming() {
         running = false;
+        if (arActive) {
+            ar.stop();
+            arActive = false;
+        }
         startButton.setText("START");
         if (sender != null) {
             sender.shutdownNow();
@@ -297,6 +342,10 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startLocation();
         }
+        if (requestCode == REQ_CAMERA && running && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startAr();
+        }
     }
 
     private void sendPacket() {
@@ -321,6 +370,7 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
         if (hasMag) b.append(",\"mag\":").append(arr(mag));
         if (hasLin) b.append(",\"lin\":").append(arr(lin));
         if (!Float.isNaN(pressure)) b.append(",\"p\":").append(fmt(pressure));
+        if (arActive) ar.appendJson(b);
         Location l = lastLocation;
         if (l != null) {
             b.append(",\"gps\":{\"lat\":").append(String.format(Locale.US, "%.8f", l.getLatitude()))
@@ -416,6 +466,7 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
                     .append(viaHello ? "  (PC hello)" : "").append('\n');
         }
         b.append("orientation src: ").append(quatSource).append('\n');
+        if (ar != null) b.append(arActive ? ar.status() : "camera VIO: off").append('\n');
         b.append(String.format(Locale.US, "q   w%+.3f x%+.3f y%+.3f z%+.3f\n", quat[0], quat[1], quat[2], quat[3]));
         b.append(String.format(Locale.US, "acc %+7.2f %+7.2f %+7.2f m/s2\n", acc[0], acc[1], acc[2]));
         b.append(String.format(Locale.US, "gyr %+7.2f %+7.2f %+7.2f rad/s\n", gyr[0], gyr[1], gyr[2]));
@@ -434,6 +485,7 @@ public class MainActivity extends Activity implements SensorEventListener, Locat
     @Override
     protected void onDestroy() {
         stopStreaming();
+        ar.close();
         ui.removeCallbacks(statusTick);
         super.onDestroy();
     }

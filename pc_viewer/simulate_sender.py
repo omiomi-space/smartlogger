@@ -96,7 +96,7 @@ class Trajectory:
         return [(p2[i] - p0[i]) / (2 * d) for i in range(3)]
 
 
-def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None):
+def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None, ar=False):
     """Yield (true_pos_enu, packet_dict) at `rate` Hz with simulated timestamps."""
     rnd = random.Random(seed)
     traj = Trajectory(duration + 5)
@@ -107,6 +107,12 @@ def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None):
     gps = None
     n = int(duration * rate)
     heading = 0.0
+    # fake ARCore: its world frame is Y-up with an arbitrary yaw; 2 % scale error + slow drift
+    ar_yaw = math.radians(rnd.uniform(0, 360))
+    C = qmul(qaxis(0, 0, 1, ar_yaw), qaxis(1, 0, 0, math.pi / 2))   # ARCore world -> ENU
+    Cinv = [C[0], -C[1], -C[2], -C[3]]
+    ar_drift = [0.0, 0.0, 0.0]
+    ar_n = 0
     for k in range(n):
         t = k / rate
         p, walking = traj.pos(t)
@@ -143,6 +149,16 @@ def generate(duration, rate=50.0, gps_rate=1.0, seed=1, t0_ms=None):
                "mag": [12.0, 25.0, -40.0], "lin": lin_dev, "p": pressure}
         if gps:
             pkt["gps"] = gps
+        if ar and k % max(1, int(rate / 30)) == 0:
+            ar_drift = [d + rnd.gauss(0, 0.002) for d in ar_drift]
+            pe = [p[i] * 1.02 + ar_drift[i] for i in range(3)]
+            ar_n += 1
+            pkt["ar"] = {"st": "TRACKING", "n": ar_n, "ts": t * 1000.0,
+                         "p": qrot(Cinv, pe), "q": qmul(Cinv, q)}
+        elif ar and k > 0:
+            pkt["ar"] = last_ar
+        if ar:
+            last_ar = pkt.get("ar")
         yield p, pkt
 
 
@@ -153,6 +169,7 @@ def main():
     ap.add_argument("--rate", type=float, default=50)
     ap.add_argument("--gps-rate", type=float, default=1.0)
     ap.add_argument("--duration", type=float, default=600, help="seconds")
+    ap.add_argument("--ar", action="store_true", help="also send fake ARCore poses")
     ap.add_argument("--replay", default=None, help="resend a JSONL file recorded with viewer.py --record")
     args = ap.parse_args()
 
@@ -172,7 +189,7 @@ def main():
                     time.sleep(delay)
                 sock.sendto(line.encode(), (args.host, args.port))
         return
-    for k, (_, pkt) in enumerate(generate(args.duration, args.rate, args.gps_rate)):
+    for k, (_, pkt) in enumerate(generate(args.duration, args.rate, args.gps_rate, ar=args.ar)):
         delay = start + k / args.rate - time.time()
         if delay > 0:
             time.sleep(delay)
