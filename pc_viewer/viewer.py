@@ -2,8 +2,9 @@
 
 Receives the JSON/UDP stream from the SmartLogger Android app and shows the phone as a
 3D model in real time: orientation from the rotation-vector quaternion, horizontal
-position from GPS (local East/North metres around the first fix) and height from the
-barometer (falls back to GPS altitude).
+position from a Kalman filter (fusion.py) that dead-reckons with the world-frame linear
+acceleration between GPS fixes, corrected by GPS position/velocity, barometric height and
+zero-velocity updates when the phone is still.
 
 World frame = Android world frame = ENU:  X = East, Y = North, Z = Up.
 
@@ -11,6 +12,7 @@ Controls
   left-drag : orbit camera        wheel : zoom
   F         : toggle follow phone  R     : reset origin / trail
   T         : toggle trail          A     : toggle accel vector
+  K         : EKF <-> GPS-only       G     : toggle raw GPS fix markers
   Esc       : quit
 """
 
@@ -24,14 +26,16 @@ import threading
 import time
 from collections import deque
 
+import numpy as np
+
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
+from fusion import Fusion
 from panda3d.core import (
     AmbientLight, DirectionalLight, GeomNode, LineSegs, NodePath, Quat, TextNode,
     Vec3, Vec4, loadPrcFileData, CardMaker, AntialiasAttrib,
 )
 
-EARTH_R = 6378137.0
 
 
 # --------------------------------------------------------------------------- receiver
@@ -41,8 +45,12 @@ class Receiver(threading.Thread):
 
     HELLO = b"SMARTLOGGER_HELLO"
 
-    def __init__(self, port: int, phone: str = None):
+    def __init__(self, port: int, phone: str = None, alt_source: str = "baro"):
         super().__init__(daemon=True)
+        self.fusion = Fusion()
+        self.alt_source = alt_source
+        self._new_fix_points = []
+        self.record = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", port))
@@ -89,9 +97,12 @@ class Receiver(threading.Thread):
             except OSError:
                 return
             try:
-                pkt = json.loads(data.decode("utf-8"))
+                text = data.decode("utf-8")
+                pkt = json.loads(text)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
+            if self.record is not None:
+                self.record.write(text + "\n")
             now = time.time()
             with self.lock:
                 seq = pkt.get("seq")
@@ -108,6 +119,28 @@ class Receiver(threading.Thread):
                 if gps and gps.get("t") != self._last_gps_t:
                     self._last_gps_t = gps.get("t")
                     self.new_gps.append(gps)
+                fpkt = pkt if self.alt_source != "gps" else {k: v for k, v in pkt.items() if k != "p"}
+                n_pts = len(self.fusion.gps_points)
+                self.fusion.process(fpkt)
+                if len(self.fusion.gps_points) != n_pts and self.fusion.gps_points:
+                    self._new_fix_points.append(self.fusion.gps_points[-1])
+
+    def reset_fusion(self):
+        with self.lock:
+            self.fusion.reset()
+            self._new_fix_points.clear()
+
+    def fusion_state(self):
+        """Copy of the filter outputs; the GPS correction jump and new fix points are consumed."""
+        with self.lock:
+            f = self.fusion
+            st = {"pos": f.pos.copy(), "vel": f.vel.copy(), "bias": f.bias.copy(), "jump": f.jump.copy(),
+                  "still": f.still, "gps_age": f.gps_age(), "gps_interval": f.gps_interval,
+                  "new_fixes": list(self._new_fix_points),
+                  "pos_sigma": float(np.sqrt(max(f.P[0, 0], f.P[1, 1])))}
+            f.jump[:] = 0
+            self._new_fix_points.clear()
+            return st
 
     def snapshot(self):
         with self.lock:
@@ -213,7 +246,9 @@ class Viewer(ShowBase):
         loadPrcFileData("", "window-title SmartLogger 3D Viewer\nwin-size 1280 800\nframebuffer-multisample 1\nmultisamples 4\nsync-video 1")
         super().__init__()
         self.args = args
-        self.rx = Receiver(args.port, args.phone)
+        self.rx = Receiver(args.port, args.phone, args.alt)
+        if getattr(args, "record", None):
+            self.rx.record = open(args.record, "a", encoding="utf-8", buffering=1)
         self.rx.start()
 
         self.setBackgroundColor(0.08, 0.08, 0.1, 1)
@@ -259,13 +294,17 @@ class Viewer(ShowBase):
         self.drop_line = None
         self.accel_np = None
         self.trail_np = None
+        self.fix_np = None
 
         # state
-        self.origin = None            # (lat0, lon0)
-        self.p0 = None                # reference pressure hPa
-        self.gps_alt0 = None
-        self.target = Vec3(0, 0, 0)   # where the phone should be (m, ENU)
-        self.pos = Vec3(0, 0, 0)      # smoothed displayed position
+        self.mode = args.mode         # "ekf" or "gps"
+        self.target = Vec3(0, 0, 0)   # GPS-only mode: last fix (m, ENU)
+        self.pos = Vec3(0, 0, 0)      # displayed position
+        self.corr = Vec3(0, 0, 0)     # EKF mode: GPS correction being blended in smoothly
+        self.fixes = deque(maxlen=3000)
+        self.fixes_dirty = False
+        self.show_fixes = True
+        self.fstate = None
         self.trail = deque(maxlen=5000)
         self.trail_dirty = False
         self.show_trail = True
@@ -285,6 +324,8 @@ class Viewer(ShowBase):
         self.accept("f", self._toggle, ["follow"])
         self.accept("t", self._toggle, ["show_trail"])
         self.accept("a", self._toggle, ["show_accel"])
+        self.accept("g", self._toggle, ["show_fixes"])
+        self.accept("k", self._toggle_mode)
         self.accept("r", self.reset_origin)
         self.accept("escape", self.userExit)
 
@@ -292,7 +333,7 @@ class Viewer(ShowBase):
                                 align=TextNode.ALeft, mayChange=True, font=self.loader.loadFont("cmtt12"))
         self.hud.reparentTo(self.a2dTopLeft)
         self.hud.setPos(0.04, -0.07)
-        help_txt = OnscreenText(text="drag: orbit  wheel: zoom  F: follow  R: reset origin  T: trail  A: accel  Esc: quit",
+        help_txt = OnscreenText(text="drag: orbit  wheel: zoom  F: follow  R: reset  T: trail  A: accel  K: EKF/GPS  G: GPS fixes  Esc: quit",
                                 scale=0.04, fg=(0.6, 0.6, 0.7, 1), align=TextNode.ALeft)
         help_txt.reparentTo(self.a2dBottomLeft)
         help_txt.setPos(0.04, 0.04)
@@ -303,6 +344,11 @@ class Viewer(ShowBase):
     def _toggle(self, name):
         setattr(self, name, not getattr(self, name))
         self.trail_dirty = True
+        self.fixes_dirty = True
+
+    def _toggle_mode(self):
+        self.mode = "gps" if self.mode == "ekf" else "ekf"
+        self.corr = Vec3(0, 0, 0)
 
     def _zoom(self, f):
         self.cam_dist = min(max(self.cam_dist * f, 0.3), 2000)
@@ -317,36 +363,14 @@ class Viewer(ShowBase):
         self.dragging = False
 
     def reset_origin(self):
-        self.origin = None
-        self.p0 = None
-        self.gps_alt0 = None
+        self.rx.reset_fusion()
         self.target = Vec3(0, 0, 0)
         self.pos = Vec3(0, 0, 0)
+        self.corr = Vec3(0, 0, 0)
         self.trail.clear()
+        self.fixes.clear()
         self.trail_dirty = True
-
-    # ---------------------------------------------------------------- data -> position
-    def _enu_from_gps(self, gps):
-        lat, lon = gps["lat"], gps["lon"]
-        if self.origin is None:
-            self.origin = (lat, lon)
-        lat0, lon0 = self.origin
-        e = math.radians(lon - lon0) * EARTH_R * math.cos(math.radians(lat0))
-        n = math.radians(lat - lat0) * EARTH_R
-        return e, n
-
-    def _height(self, pkt):
-        p = pkt.get("p")
-        if p and self.args.alt != "gps":
-            if self.p0 is None:
-                self.p0 = p
-            return 44330.0 * (1.0 - (p / self.p0) ** (1 / 5.255)), "baro"
-        gps = pkt.get("gps")
-        if gps and gps.get("alt") is not None:
-            if self.gps_alt0 is None:
-                self.gps_alt0 = gps["alt"]
-            return gps["alt"] - self.gps_alt0, "gps"
-        return 0.0, "-"
+        self.fixes_dirty = True
 
     # ---------------------------------------------------------------- frame
     def update(self, task):
@@ -363,22 +387,32 @@ class Viewer(ShowBase):
 
         height_src = "-"
         q = None
+        fs = self.fstate = self.rx.fusion_state()
         if pkt is not None:
             for gps in new_gps:
                 self.gps_info = gps
-                e, n = self._enu_from_gps(gps)
-                self.target.x, self.target.y = e, n
-            h, height_src = self._height(pkt)
-            self.target.z = h
+            height_src = "baro" if ("p" in pkt and self.args.alt != "gps") else ("gps" if self.gps_info else "-")
             if "q" in pkt:
                 w, x, y, z = pkt["q"]
                 q = Quat(w, x, y, z)
                 q.normalize()
                 self.phone.setQuat(q)
+        for fx in fs["new_fixes"]:
+            self.fixes.append(Vec3(*fx))
+            self.target = Vec3(fx[0], fx[1], 0)
+            self.fixes_dirty = True
 
-        # smooth position (GPS comes at ~1-10 Hz)
-        k = 1.0 - math.exp(-dt * self.args.smooth)
-        self.pos += (self.target - self.pos) * k
+        fused = Vec3(*fs["pos"])
+        if self.mode == "ekf":
+            # Show the filter output; GPS corrections are blended in over ~0.5 s instead of jumping.
+            self.corr -= Vec3(*fs["jump"])
+            self.corr *= math.exp(-dt / 0.5)
+            self.pos = fused + self.corr
+        else:
+            # GPS-only: smooth toward the last fix (height still from the filter / barometer)
+            self.target.z = fused.z
+            k = 1.0 - math.exp(-dt * self.args.smooth)
+            self.pos += (self.target - self.pos) * k
         self.phone_pos_np.setPos(self.pos)
         self.shadow.setPos(self.pos.x, self.pos.y, 0.001)
 
@@ -408,6 +442,26 @@ class Viewer(ShowBase):
                 self.trail_np.setLightOff()
                 self.trail_np.reparentTo(self.render)
             self.trail_dirty = False
+
+        # raw GPS fixes
+        if self.fixes_dirty:
+            if self.fix_np is not None:
+                self.fix_np.removeNode()
+                self.fix_np = None
+            if self.show_fixes and self.fixes:
+                ls = LineSegs()
+                ls.setThickness(2)
+                ls.setColor(0.2, 0.9, 1, 0.9)
+                r = 0.15
+                for p in self.fixes:
+                    ls.moveTo(p.x - r, p.y, p.z)
+                    ls.drawTo(p.x + r, p.y, p.z)
+                    ls.moveTo(p.x, p.y - r, p.z)
+                    ls.drawTo(p.x, p.y + r, p.z)
+                self.fix_np = NodePath(ls.create())
+                self.fix_np.setLightOff()
+                self.fix_np.reparentTo(self.render)
+            self.fixes_dirty = False
 
         # linear acceleration vector in world frame
         if self.accel_np is not None:
@@ -465,6 +519,15 @@ class Viewer(ShowBase):
         else:
             lines.append("GPS: no fix")
         lines.append(f"pos  E{self.pos.x:+8.2f}  N{self.pos.y:+8.2f}  U{self.pos.z:+7.2f} m  (height: {height_src})")
+        fs = self.fstate
+        if fs is not None:
+            v = fs["vel"]
+            age = fs["gps_age"]
+            age_txt = "no fix" if age is None else f"{age:4.1f}s ago (every {fs['gps_interval']:.1f}s)"
+            lines.append(f"vel  E{v[0]:+6.2f} N{v[1]:+6.2f} U{v[2]:+6.2f} m/s  |{math.hypot(v[0], v[1]) * 3.6:5.1f} km/h|"
+                         f"  {'STILL' if fs['still'] else 'moving'}")
+            lines.append(f"mode {self.mode.upper()}  GPS {age_txt}  pos sigma {fs['pos_sigma']:.1f} m"
+                         f"  bias {fs['bias'][0]:+.2f} {fs['bias'][1]:+.2f} {fs['bias'][2]:+.2f}")
         lines.append(f"follow {'on' if self.follow else 'off'}")
         return "\n".join(lines)
 
@@ -537,10 +600,13 @@ def main():
     ap.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default 5005)")
     ap.add_argument("--scale", type=float, default=8.0, help="phone model scale factor vs. real size (default 8)")
     ap.add_argument("--alt", choices=["baro", "gps"], default="baro", help="height source (default baro)")
-    ap.add_argument("--smooth", type=float, default=4.0, help="position smoothing rate 1/s (default 4)")
+    ap.add_argument("--smooth", type=float, default=4.0, help="GPS-only mode smoothing rate 1/s (default 4)")
+    ap.add_argument("--mode", choices=["ekf", "gps"], default="ekf",
+                    help="position: ekf = accel dead reckoning + GPS fusion (default), gps = GPS only")
     ap.add_argument("--accel-scale", type=float, default=0.3, help="metres per m/s2 for accel arrow")
     ap.add_argument("--grid", type=float, default=100, help="half size of ground grid in metres")
     ap.add_argument("--no-firewall", action="store_true", help="skip the Windows firewall check")
+    ap.add_argument("--record", default=None, help="append every received packet to this JSONL file")
     ap.add_argument("--phone", default=None,
                     help="phone IP[:port] to send hello to (needed behind ESET-like firewalls); "
                          "'adb' = detect the IP via ADB. Port defaults to --port")
